@@ -1,2 +1,2 @@
 aiogram>=3.0
-staypresent[prod]
+andro-cfw
