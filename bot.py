@@ -4,18 +4,16 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery
 
-# Берем токен из переменной окружения (на GitHub это будет секрет)
 TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- ВРЕМЕННОЕ ХРАНИЛИЩЕ (при перезапуске всё сотрется) ---
-# Для теста этого хватит. Потом заменишь на SQLite или JSON-файл.
-user_city = {}       # Кто какой город выбрал: {id_пользователя: "sovgavan"}
-user_notify = {}     # Кто купил уведомления: {id_пользователя: True}
-station_status = {}  # Статус заправок: {"sovgavan": [{"name": "...", "addr": "...", "status": "...", "time": "..."}]}
+# Хранилище
+user_city = {}       
+user_notify = {}     
+station_status = {}  
+temp_station = {}    # Временное хранилище для названия заправки перед выбором статуса
 
-# --- СТАРТ БОТА ---
 @dp.message(Command("start"))
 async def start(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -24,7 +22,6 @@ async def start(message: Message):
     ])
     await message.answer("Выбери свой город:", reply_markup=kb)
 
-# --- ВЫБОР ГОРОДА ---
 @dp.callback_query(F.data.startswith("city_"))
 async def set_city(cb: CallbackQuery):
     city = cb.data.replace("city_", "")
@@ -39,7 +36,6 @@ async def set_city(cb: CallbackQuery):
     await cb.message.edit_text(f"Город: {city_name}\n\nЧто делаем?", reply_markup=kb)
     await cb.answer()
 
-# --- ПОСМОТРЕТЬ СТАТУС ЗАПРАВОК ---
 @dp.callback_query(F.data == "view")
 async def view(cb: CallbackQuery):
     city = user_city.get(cb.from_user.id)
@@ -49,20 +45,23 @@ async def view(cb: CallbackQuery):
         
     stations = station_status.get(city, [])
     if not stations:
-        await cb.message.answer("Пока нет данных по заправкам. Будь первым — нажми «Сообщить»!")
+        text = "Пока нет данных по заправкам. Будь первым — нажми «Сообщить»!"
     else:
-        # Формируем красивый список
-        text = "\n".join([f"{s['status']} *{s['name']}* ({s['addr']}) — обновлено {s['time']}" for s in stations])
-        await cb.message.answer(text, parse_mode="Markdown")
+        text = "📍 *Актуальные данные:*\n\n"
+        for s in stations:
+            text += f"{s['status']} *{s['name']}* ({s['addr']}) — {s['time']}\n"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="view")]
+    ])
+    await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
     await cb.answer()
 
-# --- СООБЩИТЬ О ЗАПРАВКЕ (ШАГ 1: просим текст) ---
 @dp.callback_query(F.data == "report")
 async def report_start(cb: CallbackQuery):
-    await cb.message.answer("Напиши название и адрес заправки через запятую.\nПример: `Трансбункер, ул. Ленина 5`", parse_mode="Markdown")
+    await cb.message.edit_text("Напиши название и адрес заправки через запятую.\nПример: `Трансбункер, ул. Ленина 5`", parse_mode="Markdown")
     await cb.answer()
 
-# --- СООБЩИТЬ О ЗАПРАВКЕ (ШАГ 2: ловим текст с запятой) ---
 @dp.message(F.text.contains(","))
 async def receive_report(message: Message):
     city = user_city.get(message.from_user.id)
@@ -77,17 +76,56 @@ async def receive_report(message: Message):
     name = parts[0].strip()
     addr = parts[1].strip()
     
-    # Для простоты ставим статус "Есть". Позже сделаешь кнопки (Есть / Нет / Очередь)
-    station_status.setdefault(city, []).append({
-        "name": name, 
-        "addr": addr, 
-        "status": "✅ Есть", 
-        "time": "только что"
-    })
+    # Сохраняем во временное хранилище
+    temp_station[message.from_user.id] = {"name": name, "addr": addr}
     
-    await message.answer(f"Спасибо! Добавлено: {name} ({addr}) — ✅ Есть")
+    # Спрашиваем статус кнопками
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Есть бензин", callback_data="status_yes")],
+        [InlineKeyboardButton(text="⏳ Очередь", callback_data="status_queue")],
+        [InlineKeyboardButton(text="❌ Нет бензина", callback_data="status_no")]
+    ])
+    await message.answer(f"Заправка: {name} ({addr}).\nЧто там сейчас?", reply_markup=kb)
 
-# --- ПОКУПКА УВЕДОМЛЕНИЙ ---
+@dp.callback_query(F.data.startswith("status_"))
+async def set_status(cb: CallbackQuery):
+    status_type = cb.data.replace("status_", "")
+    station = temp_station.get(cb.from_user.id)
+    city = user_city.get(cb.from_user.id)
+    
+    if not station or not city:
+        await cb.answer("Ошибка. Нажми /start")
+        return
+
+    status_text = {
+        "yes": "✅ Есть", 
+        "queue": "⏳ Очередь", 
+        "no": "❌ Нет"
+    }[status_type]
+    
+    # Проверяем, есть ли уже такая заправка, чтобы не дублировать
+    stations = station_status.setdefault(city, [])
+    existing = next((s for s in stations if s['name'].lower() == station['name'].lower()), None)
+    
+    if existing:
+        existing['status'] = status_text
+        existing['time'] = "только что"
+    else:
+        stations.append({
+            "name": station['name'], 
+            "addr": station['addr'], 
+            "status": status_text, 
+            "time": "только что"
+        })
+        
+    del temp_station[cb.from_user.id]
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Посмотреть заправки", callback_data="view")]
+    ])
+    await cb.message.edit_text(f"✅ Спасибо! Заправка *{station['name']}* обновлена: {status_text}", parse_mode="Markdown", reply_markup=kb)
+    await cb.answer()
+
 @dp.callback_query(F.data == "buy_notify")
 async def buy_notify(cb: CallbackQuery):
     await bot.send_invoice(
@@ -95,25 +133,22 @@ async def buy_notify(cb: CallbackQuery):
         title="Уведомления о бензине",
         description="30 дней уведомлений, когда на заправках появляется топливо",
         payload="notify_30d",
-        provider_token="",  # Для Stars ВСЕГДА пустая строка
-        currency="XTR",     # Код валюты Telegram Stars
-        prices=[LabeledPrice(label="30 дней", amount=50)], # 50 звезд
-        subscription_period=2592000  # 30 дней в секундах
+        provider_token="", 
+        currency="XTR",
+        prices=[LabeledPrice(label="30 дней", amount=50)],
+        subscription_period=2592000 
     )
     await cb.answer()
 
-# --- ПОДТВЕРЖДЕНИЕ ОПЛАТЫ (Telegram требует ответить за 10 секунд) ---
 @dp.pre_checkout_query()
 async def pre_checkout(query: PreCheckoutQuery):
     await query.answer(ok=True)
 
-# --- УСПЕШНАЯ ОПЛАТА (включаем уведомления) ---
 @dp.message(F.successful_payment)
 async def payment_ok(message: Message):
     user_notify[message.from_user.id] = True
-    await message.answer("✅ Уведомления активированы на 30 дней! Когда кто-то сообщит о бензине, я пришлю пуш.")
+    await message.answer("✅ Уведомления активированы на 30 дней!")
 
-# --- ЗАПУСК ---
 async def main():
     await dp.start_polling(bot)
 
