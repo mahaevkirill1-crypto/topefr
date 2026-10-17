@@ -1,9 +1,7 @@
-import os
-import staypresent
+import andro_cfw
 
-# Код твоего бота остается в bot.py, мы его не трогаем
-# StayPresent запускает bot.py и держит порт открытым для Koyeb
-staypresent.run(
-    "bot.py",
-    port=int(os.getenv("PORT", 8080))
-)
+# Этот патч перенаправляет все запросы бота через Cloudflare
+session = andro_cfw.patch()
+
+# Запускаем твой существующий bot.py
+import bot
